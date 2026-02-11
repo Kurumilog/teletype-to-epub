@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Интерактивный парсер глав с teletype.in и сборка EPUB.
+Версия на requests + BeautifulSoup (без Selenium).
 """
 
 import os
@@ -16,13 +17,7 @@ import traceback
 import textwrap
 
 from typing import List, Dict, Tuple, Optional, Set
-
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from bs4 import BeautifulSoup
 
 from ebooklib import epub
 from PIL import Image
@@ -34,8 +29,12 @@ from io import BytesIO
 DEFAULT_LINKS_FILES = ["example.txt", "links.txt"]
 CACHE_DIR = "cache"
 IMAGES_DIR = "images"
-DEFAULT_DELAY_MIN = 3
-DEFAULT_DELAY_MAX = 7
+DEFAULT_DELAY_MIN = 1
+DEFAULT_DELAY_MAX = 3
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+}
 
 CSS_CONTENT = """
 body {
@@ -88,38 +87,6 @@ class Config:
         return "ru"
 
 
-# ─── Selenium: инициализация ─────────────────────────────────────────────────
-
-def make_driver() -> webdriver.Chrome:
-    opts = Options()
-    # Комментируем headless, чтобы видеть процесс (как в исходном коде)
-    # opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    
-    # Универсальный User-Agent (выглядит как обычный Windows Chrome, чтобы меньше блокировали)
-    opts.add_argument(
-        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    )
-
-    # Selenium 4.6+ умеет сам находить драйвер.
-    # Если драйвер в PATH, он его найдет. Если нет — Selenium Manager попытается его скачать.
-    service = Service() 
-
-    try:
-        driver = webdriver.Chrome(service=service, options=opts)
-        driver.set_page_load_timeout(60)
-        return driver
-    except Exception as e:
-        print("\n❌ Ошибка запуска ChromeDriver.")
-        print("Убедитесь, что Google Chrome установлен.")
-        print(f"Детали ошибки: {e}")
-        sys.exit(1)
-
-
 # ─── Парсинг ссылок ──────────────────────────────────────────────────────────
 
 def parse_links_file(filepath: str) -> Tuple[Dict[int, Dict[str, str]], List[str]]:
@@ -161,65 +128,120 @@ def parse_links_file(filepath: str) -> Tuple[Dict[int, Dict[str, str]], List[str
     return chapters, sorted(list(editors_set))
 
 
-# ─── Парсинг одной главы ─────────────────────────────────────────────────────
+# ─── Парсинг одной главы (Requests + BS4) ────────────────────────────────────
 
-def fetch_chapter(driver: webdriver.Chrome, url: str, include_images: bool) -> dict:
+def fetch_chapter(url: str, include_images: bool) -> dict:
     """Возвращает {'title': str, 'html': str, 'images': [(url, bytes), ...]}"""
 
-    driver.get(url)
-
-    # Ждём загрузки
-    WebDriverWait(driver, 30).until(
-        EC.presence_of_element_located((By.CSS_SELECTOR, "article.article__content"))
-    )
-    time.sleep(1.5) # Небольшая пауза для верности
-
-    # ── Заголовок ──
+    resp = requests.get(url, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    # Принудительно ставим UTF-8, так как Teletype может не отдавать charset в заголовках,
+    # и requests по умолчанию выберет ISO-8859-1, что сломает кириллицу.
+    resp.encoding = 'utf-8'
+    
+    # ── Извлечение JSON-данных (Hydration) ──
+    # Teletype отдает контент внутри window.__INITIAL_STATE__
+    text_data = resp.text
+    
+    start_marker = "window.__INITIAL_STATE__="
+    
+    start_idx = text_data.find(start_marker)
+    if start_idx == -1:
+        # Fallback на случай, если структура изменится или это статический рендер
+        return fetch_chapter_fallback(resp.text, include_images)
+        
+    start_idx += len(start_marker)
+    # Ищем конец JSON. Обычно это ";window." или "</script>"
+    # Чаще всего: ...};window.__PUBLIC_PATH__
+    
+    # Попробуем найти ближайший ";window."
+    end_idx = text_data.find(";window.", start_idx)
+    if end_idx == -1:
+        # Попробуем </script>
+        end_idx = text_data.find("</script>", start_idx)
+    
+    if end_idx == -1:
+         return fetch_chapter_fallback(resp.text, include_images)
+         
+    json_str = text_data[start_idx:end_idx]
+    
     try:
-        title_el = driver.find_element(By.CSS_SELECTOR, "h1.article__header_title")
-        title = title_el.text.strip()
-    except Exception:
-        title = ""
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        print("   ⚠ Ошибка парсинга JSON state, пробуем fallback...")
+        return fetch_chapter_fallback(resp.text, include_images)
+    
+    # Ищем статью
+    # data['articles']['items'] - словарь, где ключи это ID
+    articles_map = data.get("articles", {}).get("items", {})
+    if not articles_map:
+        return fetch_chapter_fallback(resp.text, include_images)
+    
+    # Берем первую статью (обычно она одна на странице)
+    article_item = next(iter(articles_map.values()))
+    
+    title = article_item.get("title", "")
+    raw_html_content = article_item.get("text", "") # Это строка с HTML
+    
+    if not raw_html_content:
+        return {"title": title, "html": "<p>(Пусто)</p>", "images": []}
 
-    # ── Контент ──
-    article = driver.find_element(By.CSS_SELECTOR, "article.article__content")
-    children = article.find_elements(By.XPATH, "./*")
-
+    # Парсим HTML контент из JSON
+    soup = BeautifulSoup(raw_html_content, 'lxml')
+    
     content_parts: list[str] = []
     images: list[tuple[str, bytes]] = []
 
-    for child in children:
-        tag = child.tag_name.lower()
+    # Корневой элемент там часто <document>, перебираем его детей
+    # Если <document> нет, BS распарсит как html/body/p и т.д.
+    # Проще просто перебрать все элементы верхнего уровня (исключая html/body если BS их добавил)
+    
+    # BS добавляет <html><body> если их нет.
+    # Если исходник был <document>..., то он будет внутри body
+    
+    body = soup.find("body")
+    root = body if body else soup
+    
+    # Иногда <document> внутри body
+    doc_tag = root.find("document")
+    if doc_tag:
+        root = doc_tag
 
-        if tag == "figure":
-            if not include_images:
-                continue # Пропускаем картинки
-                
-            try:
-                img_el = child.find_element(By.TAG_NAME, "img")
-                img_url = img_el.get_attribute("src")
-                if img_url:
-                    img_data = download_image(img_url)
-                    if img_data:
-                        img_hash = hashlib.md5(img_url.encode()).hexdigest()
-                        ext = "jpg" if "jpeg" in img_url or "jpg" in img_url else "png"
-                        img_filename = f"img_{img_hash}.{ext}"
-                        images.append((img_filename, img_data))
-                        content_parts.append(
-                            f'<p style="text-align:center;">'
-                            f'<img src="images/{img_filename}" alt="" />'
-                            f"</p>"
-                        )
-            except Exception:
-                pass
+    for child in root.children:
+        if child.name is None:
             continue
+            
+        tag = child.name.lower()
 
-        if tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"):
-            inner = get_inner_html(driver, child)
+        if tag == "image": 
+            # В JSON-HTML teletype часто использует тег <image src="..."> вместо <img> или <figure>
+            # Пример: <image src="..." ...><caption/></image>
+            if not include_images:
+                continue
+
+            img_src = child.get("src")
+            if img_src:
+                img_data = download_image(img_src)
+                if img_data:
+                    img_hash = hashlib.md5(img_src.encode()).hexdigest()
+                    ext = "jpg" if "jpeg" in img_src or "jpg" in img_src else "png"
+                    img_filename = f"img_{img_hash}.{ext}"
+                    images.append((img_filename, img_data))
+                    content_parts.append(
+                        f'<p style="text-align:center;">'
+                        f'<img src="images/{img_filename}" alt="" />'
+                        f"</p>"
+                    )
+            continue
+            
+        # Обычные теги
+        if tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "ul", "ol", "div"):
+            inner = child.decode_contents()
             inner = clean_html(inner)
+            
             if inner.strip():
-                # Проверяем центрирование
-                align = child.get_attribute("data-align") or ""
+                # Центрирование
+                align = child.get("align", "") # В JSON версии attribute align часто прямо в теге
                 style = ' style="text-align:center;"' if align == "center" else ""
                 content_parts.append(f"<{tag}{style}>{inner}</{tag}>")
 
@@ -227,8 +249,74 @@ def fetch_chapter(driver: webdriver.Chrome, url: str, include_images: bool) -> d
     return {"title": title, "html": html, "images": images}
 
 
-def get_inner_html(driver: webdriver.Chrome, element) -> str:
-    return driver.execute_script("return arguments[0].innerHTML;", element)
+def fetch_chapter_fallback(html_source: str, include_images: bool) -> dict:
+    """Старый метод парсинга через BS, если JSON не нашли (или если это сохраненная страница)"""
+    soup = BeautifulSoup(html_source, 'lxml')
+
+    # ── Заголовок ──
+    title_el = soup.select_one("h1.article__header_title")
+    title = title_el.get_text(strip=True) if title_el else ""
+
+    # ── Контент ──
+    article = soup.select_one("article.article__content")
+    if not article:
+        article = soup.select_one("div.article__content")
+    
+    if not article:
+         return {"title": title, "html": "<p>Не удалось найти контент (ни JSON, ни HTML)</p>", "images": []}
+
+    content_parts: list[str] = []
+    images: list[tuple[str, bytes]] = []
+
+    for child in article.children:
+        if child.name is None:
+            continue
+        
+        tag = child.name.lower()
+
+        if tag == "figure":
+            if not include_images:
+                continue 
+            
+            img_src = None
+            noscript = child.select_one("noscript")
+            if noscript:
+                ns_soup = BeautifulSoup(noscript.decode_contents(), "lxml")
+                img_el = ns_soup.find("img")
+                if img_el and img_el.get("src"):
+                    img_src = img_el.get("src")
+            
+            if not img_src:
+                img_el = child.find("img")
+                if img_el:
+                     img_src = img_el.get("src") or img_el.get("data-src")
+
+            if img_src:
+                img_data = download_image(img_src)
+                if img_data:
+                    img_hash = hashlib.md5(img_src.encode()).hexdigest()
+                    ext = "jpg" if "jpeg" in img_src or "jpg" in img_src else "png"
+                    img_filename = f"img_{img_hash}.{ext}"
+                    images.append((img_filename, img_data))
+                    content_parts.append(
+                        f'<p style="text-align:center;">'
+                        f'<img src="images/{img_filename}" alt="" />'
+                        f"</p>"
+                    )
+            continue
+
+        if tag in ("p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "ul", "ol", "div"):
+            inner = child.decode_contents()
+            inner = clean_html(inner)
+            
+            if inner.strip():
+                align = child.get("data-align", "")
+                style = ' style="text-align:center;"' if align == "center" else ""
+                content_parts.append(f"<{tag}{style}>{inner}</{tag}>")
+
+    html = "\n".join(content_parts)
+    return {"title": title, "html": html, "images": images}
+
 
 
 def clean_html(html: str) -> str:
@@ -242,7 +330,7 @@ def clean_html(html: str) -> str:
 
 def download_image(url: str) -> bytes | None:
     try:
-        resp = requests.get(url, timeout=30)
+        resp = requests.get(url, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         return resp.content
     except Exception as e:
@@ -382,7 +470,7 @@ def setup_config() -> Config:
     conf = Config()
     clear_screen()
     print("═" * 50)
-    print("   Teletype EPUB Builder (Interactive)")
+    print("   Teletype EPUB Builder (Requests Version)")
     print("═" * 50)
     print()
 
@@ -526,25 +614,20 @@ def main():
         os.makedirs(IMAGES_DIR, exist_ok=True)
 
     result_data = []
-    driver = None
 
     try:
         # Сначала проверяем кэш
         uncached_queue = []
         for num, url in chapters_queue:
             cached = load_cache(num, CACHE_DIR)
-            # Если в кэше есть, и мы хотим картинки, но в кэше их нет (или наоборот) -> лучше перекачать?
-            # Упростим: если есть в кэше, берем из кэша.
-            # Но если пользователь хочет картинки, а в кэше has_images=False, то надо бы перекачать. 
-            # Добавим простую проверку:
             
+            # Логика повторного скачивания если нужны картинки, а их нет
             need_reparse = False
-            if cached:
-                # Если мы хотим картинки, а в кэше их нет (и флаг has_images=False)
-                if conf.include_images and not cached.get("has_images", False) and not cached.get("images"):
-                     # Возможно глава просто без картинок, но мы не знаем.
-                     # Для простоты: верим кэшу.
-                     pass
+            if cached and conf.include_images and not cached.get("has_images") and not cached.get("images"):
+                # Для упрощения: если нет картинок в кэше, а мы их хотим - считаем, что надо перекачать.
+                # Но вдруг статья сама по себе без картинок? 
+                # (В такой простой версии кэш есть кэш. Хочешь перекачать - удали кэш)
+                pass
 
             if cached:
                 print(f"📖 Глава {num} взята из кэша.")
@@ -554,20 +637,19 @@ def main():
 
         # Если что-то осталось не из кэша
         if uncached_queue:
-            print("\n🌐 Запуск браузера...")
-            driver = make_driver()
+            print(f"\n🌐 Запуск скачивания (Requests)...")
             
             total = len(uncached_queue)
             for idx, (num, url) in enumerate(uncached_queue, 1):
                 print(f"[{idx}/{total}] Парсинг главы {num}...")
                 print(f"   Url: {url}")
                 
-                # Попытка парсинга с ретраями (на случай сетевых сбоев)
+                # Попытка парсинга с ретраями
                 retries = 3
                 success = False
                 while retries > 0:
                     try:
-                        data = fetch_chapter(driver, url, conf.include_images)
+                        data = fetch_chapter(url, conf.include_images)
                         data["chapter_num"] = num
                         result_data.append(data)
                         save_cache(data, CACHE_DIR)
@@ -583,25 +665,16 @@ def main():
                         time.sleep(2)
                 
                 if not success:
-                    print(f"   ❌ Не удалось скачать главу {num} после всех попыток.")
-                    # Пытаемся взять следующий приоритет?
-                    # В текущей логике мы уже выбрали URL. 
-                    # Можно усложнить и пробовать другой URL тут.
-                    # Для текущей задачи - падаем или пропускаем.
-                    # По заданию "ссылки нет -> exception". Тут ссылка есть, но не грузит.
                     raise Exception(f"Не удалось загрузить главу {num} по ссылке {url}")
 
                 if idx < total:
+                    # Пауза меньше, так как нет тяжелого браузера, но вежливость нужна
                     time.sleep(random.uniform(DEFAULT_DELAY_MIN, DEFAULT_DELAY_MAX))
 
     except Exception as e:
         print(f"\n❌ Критическая ошибка: {e}")
         traceback.print_exc()
         sys.exit(1)
-    finally:
-        if driver:
-            driver.quit()
-            print("🌐 Браузер закрыт.")
 
     # Сортировка и билд
     result_data.sort(key=lambda x: x["chapter_num"])
