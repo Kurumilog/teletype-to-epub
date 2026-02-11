@@ -15,9 +15,13 @@ cache/
 images/
 *.epub
 *.log
+*.html
+*.txt
+!example.txt
+!requirements.txt
 
-# VS Code
-.vscode/
+# Specific large files
+47fbeaab-a30a-4d1c-b9a4-d2ed7f21908e_orig.jpg
 
 # System
 .DS_Store
